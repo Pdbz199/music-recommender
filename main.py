@@ -33,7 +33,7 @@ def main():
         for i in range(10):
             print(f"\n--- Round {i+1} ---")
 
-            # 1. Generate seeds from clusters
+            # Generate seeds from clusters
             seed_tracks_ids = []
             if len(recommender.song_clusters) >= 5:
                 selected_clusters = random.sample(recommender.song_clusters, 5)
@@ -48,7 +48,7 @@ def main():
                 print("Could not generate seeds from clusters. Using random tracks from playlist.")
                 seed_tracks_ids = [track['id'] for track in random.sample(recommender.playlist_tracks, 5) if track]
 
-            # 2. Get recommendations and their features
+            # Get recommendations and their features
             try:
                 recommended_tracks = recommender.get_recommendations(seed_tracks=seed_tracks_ids, limit=20)
                 if not recommended_tracks:
@@ -74,7 +74,7 @@ def main():
             feature_matrix = np.array(feature_list)
             scaled_features = recommender.scaler.transform(feature_matrix)
 
-            # 3. Score and select the best track
+            # Score and select the best track
             scores = [bandit.predict(f.reshape(-1, 1)) for f in scaled_features]
             best_track_index = np.argmax(scores)
             best_track = valid_candidates[best_track_index]
@@ -82,7 +82,7 @@ def main():
 
             print(f"Recommended for you: {best_track['name']} by {best_track['artists'][0]['name']}")
 
-            # 4. Get feedback and update model
+            # Get feedback and update model
             feedback = input("Did you like this song? (y/n): ")
             reward = 1 if feedback.lower().strip() == 'y' else 0
 
