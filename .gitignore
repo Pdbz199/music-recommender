@@ -1,0 +1,7 @@
+.env
+.spotipyoauthcache
+notes.txt
+venv/
+.cache
+__pycache__/
+misc.py
