@@ -5,3 +5,7 @@ venv/
 .cache
 __pycache__/
 misc.py
+playlist_data.pkl
+linucb_model.pkl
+recommended_tracks.pkl
+song_clusters.html

@@ -1,15 +1,16 @@
+import json
 import numpy as np
 import os
+import pickle
 import random
 import spotipy
-import json
-import pickle
 import time
 
 from dotenv import load_dotenv
 from linucb import LinUCB
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
 from spotipy.oauth2 import SpotifyClientCredentials, SpotifyOAuth
 
 load_dotenv()
@@ -45,12 +46,14 @@ class MusicRecommender:
         self.playlist_name = playlist_name
         self.tracks_data = {}  # Using a dictionary for easier updates: {track_id: {'track': {...}, 'features': [...]}}
         self.song_clusters = []
+        self.data_reprocessed = False # This flag will track if we re-processed the data.
 
         # Load and process genres once for efficiency
         loaded_genres = self._load_genres()
         self.genre_names = [genre['name'].lower() for genre in loaded_genres]
         self.feature_keys = self.genre_names + ['track_popularity', 'artist_popularity', 'duration_ms']
         self.scaler = StandardScaler()
+        self.pca = None  # Will hold the fitted PCA model
 
         self._initialize_recommender()
 
@@ -68,47 +71,56 @@ class MusicRecommender:
         processes the songs that have been added or removed, saving significant time.
         """
 
-        # Load from cache if it exists
+        # Load the set of all track IDs from the last run, if the cache exists
+        cached_track_ids = set()
         if os.path.exists(PLAYLIST_DATA_CACHE):
             print("Loading cached playlist data...")
             with open(PLAYLIST_DATA_CACHE, 'rb') as f:
-                self.tracks_data = pickle.load(f)
-            print(f"Loaded {len(self.tracks_data)} tracks from cache.")
+                cached_data = pickle.load(f)
+                self.tracks_data = cached_data.get('tracks_data', {})
+                cached_track_ids = cached_data.get('all_track_ids', set())
+            print(f"Loaded {len(self.tracks_data)} processed tracks from cache.")
 
-        # Fetch the latest playlist state and calculate the difference
+        # Fetch the current state of the playlist from Spotify
         print("Fetching latest playlist state...")
         latest_tracks = self._get_playlist_tracks()
         latest_track_ids = {t['id'] for t in latest_tracks if t and t.get('id')}
-        cached_track_ids = set(self.tracks_data.keys())
 
+        # Compare the live playlist with the cached set of IDs to detect real changes
         added_ids = latest_track_ids - cached_track_ids
         removed_ids = cached_track_ids - latest_track_ids
 
-        # Process newly added tracks
-        if added_ids:
-            print(f"Found {len(added_ids)} new songs. Adding to cache...")
-            new_tracks = [t for t in latest_tracks if t['id'] in added_ids]
-            new_features = self.get_track_features(new_tracks)
-            for track, features in zip(new_tracks, new_features):
-                if features is not None:
-                    self.tracks_data[track['id']] = {'track': track, 'features': features}
+        # If the playlist has actually changed, or if there's no cache, we re-process everything
+        if added_ids or removed_ids or not os.path.exists(PLAYLIST_DATA_CACHE):
+            self.data_reprocessed = True
+            print("Change in playlist detected or no cache found. Processing all tracks...")
 
-        # Process removed tracks
-        if removed_ids:
-            print(f"Found {len(removed_ids)} removed songs. Removing from cache...")
-            for track_id in removed_ids:
-                del self.tracks_data[track_id]
+            # Rebuild the tracks_data dictionary from scratch
+            all_features = self.get_track_features(latest_tracks)
+            self.tracks_data = {
+                track['id']: {'track': track, 'features': features}
+                for track, features in zip(latest_tracks, all_features) if features is not None
+            }
 
-        # Re-cluster the songs if the playlist has changed or if no clusters exist yet
-        if added_ids or removed_ids or not self.song_clusters:
-            print("Change in playlist detected or no clusters found. Re-clustering...")
             self._create_song_clusters()
 
-        # Save the updated data back to the cache for the next session
-        print("Saving updated cache...")
-        with open(PLAYLIST_DATA_CACHE, 'wb') as f:
-            pickle.dump(self.tracks_data, f)
-        print("Cache updated.")
+            print("Saving updated cache...")
+            with open(PLAYLIST_DATA_CACHE, 'wb') as f:
+                pickle.dump({
+                    'tracks_data': self.tracks_data,
+                    'all_track_ids': latest_track_ids,
+                    'scaler': self.scaler,
+                    'pca': self.pca,
+                    'viz_data': self.tracks_data_for_viz,
+                }, f)
+            print("Cache updated.")
+        else:
+            # If no changes, load the rest of the data from the cache and proceed
+            with open(PLAYLIST_DATA_CACHE, 'rb') as f:
+                cached_data = pickle.load(f)
+            self.scaler = cached_data.get('scaler', self.scaler)
+            self.pca = cached_data.get('pca', self.pca)
+            self._create_song_clusters()
 
     def _spotify_api_call(self, api_callable):
         """
@@ -145,30 +157,41 @@ class MusicRecommender:
 
     def _get_playlist_tracks(self):
         """
-        Fetches all tracks from the user's specified playlist, handling pagination.
+        Fetches all tracks from the user's specified playlist, handling pagination for both
+        the list of playlists and the tracks within the target playlist.
 
         Returns:
             list: A list of track objects from the playlist.
         """
 
-        # Find the playlist by its name
-        playlists = self.user_spotify_client.current_user_playlists()
+        # Paginate through all user playlists to find the correct one by name
         playlist_id = None
-        for playlist in playlists['items']:
-            if playlist['name'] == self.playlist_name:
-                playlist_id = playlist['id']
+        playlists_response = self._spotify_api_call(lambda: self.user_spotify_client.current_user_playlists(limit=50))
+        while playlists_response:
+            for playlist in playlists_response['items']:
+                if playlist['name'] == self.playlist_name:
+                    playlist_id = playlist['id']
+                    break
+            if playlist_id:
                 break
+            if playlists_response['next']:
+                playlists_response = self._spotify_api_call(lambda: self.user_spotify_client.next(playlists_response))
+            else:
+                playlists_response = None
 
         if not playlist_id:
             print(f"Playlist '{self.playlist_name}' not found.")
             return []
 
-        # Fetch all tracks from the playlist, page by page
+        # Fetch all tracks from the playlist, page by page, with logging
         all_tracks = []
-        results = self._spotify_api_call(lambda: self.user_spotify_client.playlist_items(playlist_id))
+        page = 1
+        results = self._spotify_api_call(lambda: self.user_spotify_client.playlist_items(playlist_id, limit=100))
 
         while results:
+            print(f"Fetched page {page} with {len(results['items'])} tracks...")
             all_tracks.extend([item['track'] for item in results['items'] if item['track']])
+            page += 1
             if results['next']:
                 results = self._spotify_api_call(lambda: self.user_spotify_client.next(results))
             else:
@@ -195,8 +218,8 @@ class MusicRecommender:
         if not seed_tracks:
             return []
 
-        # Ensure we don't recommend songs the user already has
-        saved_track_ids = {t['id'] for t in self.tracks_data.values() if t and t.get('track')}
+        # Correctly get the set of saved track IDs from the keys of the tracks_data dictionary
+        saved_track_ids = set(self.tracks_data.keys())
 
         # Determine the genres of the seed tracks by looking up their artists
         seed_genres = set()
@@ -276,8 +299,16 @@ class MusicRecommender:
             list: A list of NumPy arrays, where each array is a feature vector for a track.
         """
 
-        # Batching artist API calls to avoid hitting rate limits
-        artist_ids = list({t['artists'][0]['id'] for t in tracks if t and t.get('artists')})
+        # Collect unique artist IDs from the tracks to minimize redundant API calls
+        artist_ids = set()
+        for t in tracks:
+            if t and t.get('artists'):
+                # A track can sometimes have an empty list of artists
+                if t['artists']:
+                    artist_id = t['artists'][0].get('id')
+                    if artist_id:  # Ensure the ID is not None
+                        artist_ids.add(artist_id)
+        artist_ids = list(artist_ids)
 
         # Efficiently fetch data for all required artists in batches of 50
         artist_data_map = {}
@@ -292,7 +323,7 @@ class MusicRecommender:
                 if artist:
                     artist_data_map[artist['id']] = {
                         'genres': artist['genres'],
-                        'popularity': artist['popularity']
+                        'popularity': artist['popularity'],
                     }
 
         # Build the feature vector for each track using the pre-fetched artist data
@@ -325,7 +356,7 @@ class MusicRecommender:
 
         return features_list
 
-    def _create_song_clusters(self, n_clusters=50):
+    def _create_song_clusters(self, n_clusters=50, n_pca_components=50):
         """
         Groups the user's songs into clusters based on their features.
 
@@ -344,12 +375,22 @@ class MusicRecommender:
         tracks = [d['track'] for d in tracks_with_features]
         feature_matrix = np.array([d['features'] for d in tracks_with_features])
 
+        # PCA Step
+        if feature_matrix.shape[1] > n_pca_components:
+            print(f"Performing PCA to reduce dimensionality to {n_pca_components} components...")
+            pca = PCA(n_components=n_pca_components)
+            reduced_features = pca.fit_transform(feature_matrix)
+            self.pca = pca # Save the fitted model
+        else:
+            reduced_features = feature_matrix
+            self.pca = None
+
         if len(tracks) < n_clusters:
             n_clusters = len(tracks)
 
         # Scale features for better performance with distance-based clustering
-        self.scaler.fit(feature_matrix)
-        scaled_features = self.scaler.transform(feature_matrix)
+        self.scaler.fit(reduced_features)
+        scaled_features = self.scaler.transform(reduced_features)
 
         kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
         labels = kmeans.fit_predict(scaled_features)
@@ -364,6 +405,13 @@ class MusicRecommender:
         self.song_clusters = [cluster for cluster in self.song_clusters if cluster]
         if self.song_clusters:
             print(f"Successfully created {len(self.song_clusters)} clusters from your music library.")
+
+        # Store the reduced features and PCA model for the visualizer
+        self.tracks_data_for_viz = {
+            'tracks': tracks,
+            'reduced_features': reduced_features,
+            'cluster_labels': labels,
+        }
 
     def _get_public_spotify_client(self):
         """Initializes a Spotipy client for accessing public data (Client Credentials Flow)."""
